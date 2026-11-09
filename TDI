@@ -11,10 +11,21 @@ CASE_SUBDIR = "sim_cases_final0"
 GEO_SUBDIR = "geo"
 GEO_PREFIX = "geo_"
 INPUT_CSV = "evolution.csv"
-OUTPUT_CSV = "evolution_with_index.csv"
+OUTPUT_CSV = "evolution_with_metrics.csv"
 
 NEIGHBORS = ((-1, 0), (1, 0), (0, -1), (0, 1))
-TRACK_CURRENT_SOLID = True
+
+METRIC_KEYS = (
+    "u_mean",
+    "u_p50",
+    "u_p90",
+    "decay_integral",
+    "index",
+    "open_fraction",
+    "remain_fraction",
+    "external_void_fraction",
+    "isolated_void_fraction",
+)
 
 
 def read_field(path):
@@ -52,19 +63,23 @@ def external_void_mask(field):
 
 
 class DissolutionAnalyzer:
-    def __init__(self, initial_field_path):
+    def __init__(self, initial_field_path, resistance_ratio=50.0):
         self.cost_by_phase = {
             0: 0.0,
             2: 1.0,
-            3: 50.0,
+            3: float(resistance_ratio),
             4: float("inf"),
         }
         self.reference_cost = 1.0
 
         field, self.nx, self.ny = read_field(initial_field_path)
-        self.initial_solid = field != 0
-        self.solid_count = int(self.initial_solid.sum())
+        self.reference_mask = field != 0
+        self.reference_nodes = np.argwhere(self.reference_mask)
+        self.reference_count = int(self.reference_nodes.shape[0])
         self.u_char = float(self.ny) * self.reference_cost
+
+        if self.reference_count == 0:
+            raise ValueError("reference set is empty")
 
     def cost_map(self, field):
         cost = np.zeros(field.shape, dtype=float)
@@ -72,7 +87,7 @@ class DissolutionAnalyzer:
             cost[field == phase] = value
         return cost
 
-    def accumulated_cost(self, field):
+    def distance(self, field):
         ny, nx = field.shape
         cost = self.cost_map(field)
         seeds = external_void_mask(field)
@@ -80,7 +95,7 @@ class DissolutionAnalyzer:
         dist = np.full((ny, nx), np.inf)
         heap = []
 
-        for y, x in zip(*np.where(seeds)):
+        for y, x in np.argwhere(seeds):
             y, x = int(y), int(x)
             dist[y, x] = 0.0
             heapq.heappush(heap, (0.0, y, x))
@@ -100,19 +115,69 @@ class DissolutionAnalyzer:
                         dist[j, i] = nd
                         heapq.heappush(heap, (nd, j, i))
 
-        return dist
+        return dist, seeds
 
-    def solid_mask(self, field):
-        return field != 0 if TRACK_CURRENT_SOLID else self.initial_solid
+    def snapshot(self, field):
+        if field.shape != self.reference_mask.shape:
+            raise ValueError("field shape mismatch")
 
-    def topology_index(self, field):
-        dist = self.accumulated_cost(field)
-        mask = self.solid_mask(field)
-        u = dist[mask]
-        u = u[np.isfinite(u)]
-        if u.size == 0 or self.solid_count == 0:
-            return 0.0
-        return float(np.sum(np.exp(-u / self.u_char)) / self.solid_count)
+        dist, seeds = self.distance(field)
+
+        ys = self.reference_nodes[:, 0]
+        xs = self.reference_nodes[:, 1]
+
+        u = dist[ys, xs]
+        finite = np.isfinite(u)
+        n_ref = float(self.reference_count)
+
+        u_open = u[finite]
+        solid_now = np.count_nonzero(field[ys, xs] != 0)
+        void_total = np.count_nonzero(field == 0)
+        void_external = np.count_nonzero(seeds)
+
+        if u_open.size:
+            u_mean = float(u_open.mean())
+            u_p50 = float(np.percentile(u_open, 50))
+            u_p90 = float(np.percentile(u_open, 90))
+            decay_integral = float(np.sum(np.exp(-u_open / self.u_char)))
+        else:
+            u_mean = 0.0
+            u_p50 = 0.0
+            u_p90 = 0.0
+            decay_integral = 0.0
+
+        external_fraction = float(void_external) / float(void_total) if void_total else 0.0
+
+        return {
+            "u_mean": u_mean,
+            "u_p50": u_p50,
+            "u_p90": u_p90,
+            "decay_integral": decay_integral,
+            "index": decay_integral / n_ref,
+            "open_fraction": float(np.count_nonzero(finite)) / n_ref,
+            "remain_fraction": float(solid_now) / n_ref,
+            "external_void_fraction": external_fraction,
+            "isolated_void_fraction": 1.0 - external_fraction,
+        }
+
+    def track(self, root, steps, verbose=True):
+        rows = []
+        for step in steps:
+            path = geo_path(root, int(step))
+            if not os.path.exists(path):
+                continue
+            field, _, _ = read_field(path)
+            row = {"step": int(step)}
+            row.update(self.snapshot(field))
+            rows.append(row)
+            if verbose and int(step) % 1000 == 0:
+                print(
+                    f"step={int(step):08d} "
+                    f"index={row['index']:.5f} "
+                    f"open={row['open_fraction']:.4f} "
+                    f"remain={row['remain_fraction']:.4f}"
+                )
+        return pd.DataFrame.from_records(rows, columns=["step", *METRIC_KEYS])
 
 
 def process_job(root, model_name, verbose=True):
@@ -126,31 +191,32 @@ def process_job(root, model_name, verbose=True):
 
     analyzer = DissolutionAnalyzer(initial_path)
     table = pd.read_csv(input_csv)
-    if "topology_index" not in table.columns:
-        table["topology_index"] = 0.0
+    table["step"] = table["step"].astype(int)
 
-    for i, row in table.iterrows():
-        step = int(row["step"])
-        path = geo_path(root, step)
-        if not os.path.exists(path):
-            continue
-        field, _, _ = read_field(path)
-        value = analyzer.topology_index(field)
-        table.at[i, "topology_index"] = value
-        if verbose and (step % 1000 == 0 or i == len(table) - 1):
-            print(f"step={step:08d} index={value:.5f}")
+    metrics = analyzer.track(root, sorted(table["step"].unique()), verbose=verbose)
+    if metrics.empty:
+        print(f"[skip] no snapshots for model: {model_name}")
+        return None
 
-    reference = table.loc[table["step"] == 0, "topology_index"].to_numpy()
-    ref = float(reference[0]) if reference.size else 0.0
-    table["index_norm"] = table["topology_index"] / ref if ref else 0.0
+    table = table.merge(metrics, on="step", how="left")
+    table[list(METRIC_KEYS)] = table[list(METRIC_KEYS)].interpolate(limit_direction="both")
+    table = table.sort_values("step").reset_index(drop=True)
 
-    step_arr = table["step"].to_numpy(dtype=float)
-    table["d_porosity_d_step"] = np.gradient(
-        table["porosity_norm"].to_numpy(dtype=float), step_arr
-    )
-    table["d_index_d_step"] = np.gradient(
-        table["index_norm"].to_numpy(dtype=float), step_arr
-    )
+    base = float(table["index"].iloc[0])
+    table["index_norm"] = table["index"] / base if base else 0.0
+
+    if len(table) > 1:
+        step_arr = table["step"].to_numpy(dtype=float)
+        table["d_index_norm_d_step"] = np.gradient(
+            table["index_norm"].to_numpy(dtype=float), step_arr
+        )
+        table["d_open_fraction_d_step"] = np.gradient(
+            table["open_fraction"].to_numpy(dtype=float), step_arr
+        )
+        if "porosity_norm" in table.columns:
+            table["d_porosity_norm_d_step"] = np.gradient(
+                table["porosity_norm"].to_numpy(dtype=float), step_arr
+            )
 
     table.to_csv(output_csv, index=False)
     print(f"[done] {model_name} -> {output_csv}")
