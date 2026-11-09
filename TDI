@@ -2,131 +2,144 @@ import heapq
 import os
 import struct
 
-import matplotlib.colors as mcolors
-import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+
+
+CASE_SUBDIR = "sim_cases_final0"
+GEO_SUBDIR = "geo"
+GEO_PREFIX = "geo_"
+INPUT_CSV = "evolution.csv"
+OUTPUT_CSV = "evolution_with_index.csv"
+
+
+def read_field(path):
+    with open(path, "rb") as f:
+        nx, ny, nz = struct.unpack("iii", f.read(12))
+        raw = f.read(nx * ny * nz * 4)
+    field = np.frombuffer(raw, dtype=np.int32).reshape((ny, nx))
+    return field, nx, ny
+
+
+def geo_path(root, step):
+    return os.path.join(root, GEO_SUBDIR, f"{GEO_PREFIX}{step:08d}.dat")
 
 
 class DissolutionAnalyzer:
-    def __init__(self):
-        self.R_VOID = 0.0
-        self.R_CALCITE = 1.0
-        self.R_DOLOMITE = 10.0
-        self.R_QUARTZ = float("inf")
+    def __init__(self, initial_field_path):
+        self.cost_by_phase = {
+            0: 0.0,
+            2: 1.0,
+            3: 50.0,
+            4: float("inf"),
+        }
+        self.reference_cost = 1.0
 
-    def read_dat_file(self, filename):
-        with open(filename, "rb") as file:
-            nx, ny, nz = struct.unpack("iii", file.read(12))
-            raw = file.read(nx * ny * nz * 4)
-        data = np.frombuffer(raw, dtype=np.int32).reshape((ny, nx))
-        return data, nx, ny
+        initial_field, self.nx, self.ny = read_field(initial_field_path)
+        self.initial_solid = initial_field != 0
+        self.solid_count = int(self.initial_solid.sum())
+        self.u_char = float(self.ny) * self.reference_cost
 
-    def calculate_difficulty(self, data):
-        ny, nx = data.shape
-        cost_map = np.zeros((ny, nx))
-        cost_map[data == 2] = self.R_CALCITE
-        cost_map[data == 3] = self.R_DOLOMITE
-        cost_map[data == 4] = self.R_QUARTZ
-        difficulty = np.full((ny, nx), float("inf"))
+    def cost_map(self, field):
+        cost = np.zeros(field.shape, dtype=float)
+        for phase, value in self.cost_by_phase.items():
+            cost[field == phase] = value
+        return cost
 
-        accessible_voids = np.zeros((ny, nx), dtype=bool)
-        void_queue = []
-        for y in range(ny):
-            for x in (0, nx - 1):
-                if data[y, x] == 0 and not accessible_voids[y, x]:
-                    accessible_voids[y, x] = True
-                    void_queue.append((y, x))
+    def accumulated_cost(self, field):
+        ny, nx = field.shape
+        cost = self.cost_map(field)
+        dist = np.full((ny, nx), np.inf)
+        heap = []
 
-        directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-        head = 0
-        while head < len(void_queue):
-            y, x = void_queue[head]
-            head += 1
-            for dy, dx in directions:
-                y_next, x_next = y + dy, x + dx
-                if 0 <= y_next < ny and 0 <= x_next < nx:
-                    if data[y_next, x_next] == 0 and not accessible_voids[y_next, x_next]:
-                        accessible_voids[y_next, x_next] = True
-                        void_queue.append((y_next, x_next))
+        for y, x in zip(*np.where(field == 0)):
+            y, x = int(y), int(x)
+            dist[y, x] = 0.0
+            heapq.heappush(heap, (0.0, y, x))
 
-        priority_queue = []
-        for y, x in zip(*np.where(accessible_voids)):
-            difficulty[y, x] = 0.0
-            heapq.heappush(priority_queue, (0.0, y, x))
+        neighbors = ((-1, 0), (1, 0), (0, -1), (0, 1))
 
-        while priority_queue:
-            current_cost, y, x = heapq.heappop(priority_queue)
-            if current_cost > difficulty[y, x]:
+        while heap:
+            d, y, x = heapq.heappop(heap)
+            if d > dist[y, x]:
                 continue
-            for dy, dx in directions:
-                y_next, x_next = y + dy, x + dx
-                if not (0 <= y_next < ny and 0 <= x_next < nx):
-                    continue
-                next_cost = cost_map[y_next, x_next]
-                if not np.isfinite(next_cost):
-                    continue
-                updated_cost = current_cost + next_cost
-                if updated_cost < difficulty[y_next, x_next]:
-                    difficulty[y_next, x_next] = updated_cost
-                    heapq.heappush(priority_queue, (updated_cost, y_next, x_next))
+            for dy, dx in neighbors:
+                j, i = y + dy, x + dx
+                if 0 <= j < ny and 0 <= i < nx:
+                    w = cost[j, i]
+                    if w == np.inf:
+                        continue
+                    nd = d + w
+                    if nd < dist[j, i]:
+                        dist[j, i] = nd
+                        heapq.heappush(heap, (nd, j, i))
 
-        return difficulty, accessible_voids
+        return dist
 
-    def calculate_tdi(self, data, difficulty):
-        solid_mask = data != 0
-        solid_count = np.sum(solid_mask)
-        if solid_count == 0:
-            return 0.0
-        characteristic_cost = data.shape[0] * self.R_CALCITE
-        return np.sum(np.exp(-difficulty[solid_mask] / characteristic_cost)) / solid_count
+    def topology_index(self, field):
+        dist = self.accumulated_cost(field)
+        u = dist[self.initial_solid]
+        return float(np.sum(np.exp(-u / self.u_char)) / self.solid_count)
 
-    def calculate_srsa(self, data, accessible_voids):
-        reactive_solids = (data == 2) | (data == 3)
-        surface_area = 0
-        surface_area += np.sum(accessible_voids[:, :-1] & reactive_solids[:, 1:])
-        surface_area += np.sum(accessible_voids[:, 1:] & reactive_solids[:, :-1])
-        surface_area += np.sum(accessible_voids[:-1, :] & reactive_solids[1:, :])
-        surface_area += np.sum(accessible_voids[1:, :] & reactive_solids[:-1, :])
-        return surface_area / data.size
 
-    def visualize(self, difficulty, save_path):
-        masked_difficulty = np.ma.masked_invalid(np.flipud(difficulty))
-        vmax = np.percentile(masked_difficulty.compressed(), 98) if masked_difficulty.count() else 1.0
-        cmap = plt.cm.turbo_r.copy()
-        cmap.set_bad("black")
+def process_job(root, model_name, verbose=True):
+    initial_path = os.path.join(root, CASE_SUBDIR, f"{model_name}.dat")
+    input_csv = os.path.join(root, INPUT_CSV)
+    output_csv = os.path.join(root, OUTPUT_CSV)
 
-        fig, axis = plt.subplots(figsize=(8, 6))
-        image = axis.imshow(masked_difficulty, cmap=cmap, norm=mcolors.PowerNorm(gamma=0.4, vmin=0, vmax=vmax))
-        axis.axis("off")
-        colorbar = fig.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
-        colorbar.set_label("Dissolution Cost", rotation=270, labelpad=15)
-        fig.tight_layout()
-        fig.savefig(save_path, dpi=200, bbox_inches="tight")
-        plt.close(fig)
+    if not os.path.exists(initial_path) or not os.path.exists(input_csv):
+        print(f"[skip] missing input for model: {model_name}")
+        return None
+
+    analyzer = DissolutionAnalyzer(initial_path)
+    table = pd.read_csv(input_csv)
+    if "topology_index" not in table.columns:
+        table["topology_index"] = 0.0
+
+    for i, row in table.iterrows():
+        step = int(row["step"])
+        path = geo_path(root, step)
+        if not os.path.exists(path):
+            continue
+        field, _, _ = read_field(path)
+        value = analyzer.topology_index(field)
+        table.at[i, "topology_index"] = value
+        if verbose and (step % 1000 == 0 or i == len(table) - 1):
+            print(f"step={step:08d} index={value:.5f}")
+
+    reference = table.loc[table["step"] == 0, "topology_index"].to_numpy()
+    ref = float(reference[0]) if reference.size else 0.0
+    table["index_norm"] = table["topology_index"] / ref if ref else 0.0
+
+    step_arr = table["step"].to_numpy(dtype=float)
+    table["d_porosity_d_step"] = np.gradient(
+        table["porosity_norm"].to_numpy(dtype=float), step_arr
+    )
+    table["d_index_d_step"] = np.gradient(
+        table["index_norm"].to_numpy(dtype=float), step_arr
+    )
+
+    table.to_csv(output_csv, index=False)
+    print(f"[done] {model_name} -> {output_csv}")
+    return output_csv
+
+
+JOBS = [
+    {"root": "/path/to/experiment_A/results1", "model": "model_01"},
+    {"root": "/path/to/experiment_A/results2", "model": "model_02"},
+    {"root": "/path/to/experiment_B/results1", "model": "model_03"},
+]
+
+
+def run_all(jobs):
+    total = len(jobs)
+    for i, job in enumerate(jobs):
+        print(f"progress [{i + 1}/{total}] {job['model']}")
+        try:
+            process_job(job["root"], job["model"])
+        except Exception as exc:
+            print(f"[error] {job['model']}: {exc}")
 
 
 if __name__ == "__main__":
-    input_dir = "11"
-    output_dir = "dissolution_results"
-    if not os.path.isdir(input_dir):
-        raise FileNotFoundError(f"Input directory not found: {input_dir}")
-    os.makedirs(output_dir, exist_ok=True)
-
-    file_list = [
-        "geo_00014000", "geo_00014100", "geo_00014200", "geo_00014300",
-        "geo_00014400", "geo_00014500", "geo_00014600", "geo_00014700",
-        "geo_00014800", "geo_00014900", "geo_00015000", "Case_12",
-    ]
-    analyzer = DissolutionAnalyzer()
-    for base_name in file_list:
-        data_path = os.path.join(input_dir, f"{base_name}.dat")
-        if not os.path.isfile(data_path):
-            continue
-
-        data, _, _ = analyzer.read_dat_file(data_path)
-        difficulty, accessible_voids = analyzer.calculate_difficulty(data)
-        tdi = analyzer.calculate_tdi(data, difficulty)
-        srsa = analyzer.calculate_srsa(data, accessible_voids)
-        output_name = f"{base_name}_TDI_{tdi:.4f}_SRSA_{srsa:.4f}.png"
-        analyzer.visualize(difficulty, os.path.join(output_dir, output_name))
-        print(f"{base_name}: TDI={tdi:.4f}, SRSA={srsa:.4f}")
+    run_all(JOBS)
