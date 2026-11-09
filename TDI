@@ -1,6 +1,7 @@
 import heapq
 import os
 import struct
+from collections import deque
 
 import numpy as np
 import pandas as pd
@@ -12,17 +13,41 @@ GEO_PREFIX = "geo_"
 INPUT_CSV = "evolution.csv"
 OUTPUT_CSV = "evolution_with_index.csv"
 
+NEIGHBORS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+
 
 def read_field(path):
     with open(path, "rb") as f:
         nx, ny, nz = struct.unpack("iii", f.read(12))
         raw = f.read(nx * ny * nz * 4)
-    field = np.frombuffer(raw, dtype=np.int32).reshape((ny, nx))
-    return field, nx, ny
+    return np.frombuffer(raw, dtype=np.int32).reshape((ny, nx)), nx, ny
 
 
 def geo_path(root, step):
     return os.path.join(root, GEO_SUBDIR, f"{GEO_PREFIX}{step:08d}.dat")
+
+
+def external_void_mask(field):
+    ny, nx = field.shape
+    void = field == 0
+    reachable = np.zeros_like(void, dtype=bool)
+    queue = deque()
+
+    for y in range(ny):
+        for x in (0, nx - 1):
+            if void[y, x] and not reachable[y, x]:
+                reachable[y, x] = True
+                queue.append((y, x))
+
+    while queue:
+        y, x = queue.popleft()
+        for dy, dx in NEIGHBORS:
+            j, i = y + dy, x + dx
+            if 0 <= j < ny and 0 <= i < nx and void[j, i] and not reachable[j, i]:
+                reachable[j, i] = True
+                queue.append((j, i))
+
+    return reachable
 
 
 class DissolutionAnalyzer:
@@ -35,8 +60,8 @@ class DissolutionAnalyzer:
         }
         self.reference_cost = 1.0
 
-        initial_field, self.nx, self.ny = read_field(initial_field_path)
-        self.initial_solid = initial_field != 0
+        field, self.nx, self.ny = read_field(initial_field_path)
+        self.initial_solid = field != 0
         self.solid_count = int(self.initial_solid.sum())
         self.u_char = float(self.ny) * self.reference_cost
 
@@ -49,21 +74,21 @@ class DissolutionAnalyzer:
     def accumulated_cost(self, field):
         ny, nx = field.shape
         cost = self.cost_map(field)
+        seeds = external_void_mask(field)
+
         dist = np.full((ny, nx), np.inf)
         heap = []
 
-        for y, x in zip(*np.where(field == 0)):
+        for y, x in zip(*np.where(seeds)):
             y, x = int(y), int(x)
             dist[y, x] = 0.0
             heapq.heappush(heap, (0.0, y, x))
-
-        neighbors = ((-1, 0), (1, 0), (0, -1), (0, 1))
 
         while heap:
             d, y, x = heapq.heappop(heap)
             if d > dist[y, x]:
                 continue
-            for dy, dx in neighbors:
+            for dy, dx in NEIGHBORS:
                 j, i = y + dy, x + dx
                 if 0 <= j < ny and 0 <= i < nx:
                     w = cost[j, i]
@@ -79,6 +104,9 @@ class DissolutionAnalyzer:
     def topology_index(self, field):
         dist = self.accumulated_cost(field)
         u = dist[self.initial_solid]
+        u = u[np.isfinite(u)]
+        if u.size == 0 or self.solid_count == 0:
+            return 0.0
         return float(np.sum(np.exp(-u / self.u_char)) / self.solid_count)
 
 
