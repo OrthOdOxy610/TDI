@@ -1,166 +1,145 @@
+import heapq
 import os
 import struct
 
-import matplotlib.pyplot as plt
 import numpy as np
-from scipy.ndimage import distance_transform_edt, gaussian_filter
+import pandas as pd
 
 
-class MineralTopologyGenerator:
-    def __init__(self, input_file="lbm_input.dat"):
-        self.input_file = input_file
-        self.nx = self.ny = self.nz = 0
-        self.data = None
-        self.solid_mask = None
-        self.total_solid = 0
-        self.pct_qtz = 0.50
-        self.pct_dol = 0.15
-        self.pct_cal = 0.35
-        self.load_geometry()
+CASE_SUBDIR = "sim_cases_final0"
+GEO_SUBDIR = "geo"
+GEO_PREFIX = "geo_"
+INPUT_CSV = "evolution.csv"
+OUTPUT_CSV = "evolution_with_index.csv"
 
-    def load_geometry(self):
+
+def read_field(path):
+    with open(path, "rb") as f:
+        nx, ny, nz = struct.unpack("iii", f.read(12))
+        raw = f.read(nx * ny * nz * 4)
+    field = np.frombuffer(raw, dtype=np.int32).reshape((ny, nx))
+    return field, nx, ny
+
+
+def geo_path(root, step):
+    return os.path.join(root, GEO_SUBDIR, f"{GEO_PREFIX}{step:08d}.dat")
+
+
+class DissolutionAnalyzer:
+    def __init__(self, initial_field_path):
+        self.cost_by_phase = {
+            0: 0.0,
+            2: 1.0,
+            3: 50.0,
+            4: float("inf"),
+        }
+        self.reference_cost = 1.0
+
+        initial_field, self.nx, self.ny = read_field(initial_field_path)
+        self.initial_solid = initial_field != 0
+        self.solid_count = int(self.initial_solid.sum())
+        self.u_char = float(self.ny) * self.reference_cost
+
+    def cost_map(self, field):
+        cost = np.zeros(field.shape, dtype=float)
+        for phase, value in self.cost_by_phase.items():
+            cost[field == phase] = value
+        return cost
+
+    def accumulated_cost(self, field):
+        ny, nx = field.shape
+        cost = self.cost_map(field)
+        dist = np.full((ny, nx), np.inf)
+        heap = []
+
+        for y, x in zip(*np.where(field == 0)):
+            y, x = int(y), int(x)
+            dist[y, x] = 0.0
+            heapq.heappush(heap, (0.0, y, x))
+
+        neighbors = ((-1, 0), (1, 0), (0, -1), (0, 1))
+
+        while heap:
+            d, y, x = heapq.heappop(heap)
+            if d > dist[y, x]:
+                continue
+            for dy, dx in neighbors:
+                j, i = y + dy, x + dx
+                if 0 <= j < ny and 0 <= i < nx:
+                    w = cost[j, i]
+                    if w == np.inf:
+                        continue
+                    nd = d + w
+                    if nd < dist[j, i]:
+                        dist[j, i] = nd
+                        heapq.heappush(heap, (nd, j, i))
+
+        return dist
+
+    def topology_index(self, field):
+        dist = self.accumulated_cost(field)
+        u = dist[self.initial_solid]
+        return float(np.sum(np.exp(-u / self.u_char)) / self.solid_count)
+
+
+def process_job(root, model_name, verbose=True):
+    initial_path = os.path.join(root, CASE_SUBDIR, f"{model_name}.dat")
+    input_csv = os.path.join(root, INPUT_CSV)
+    output_csv = os.path.join(root, OUTPUT_CSV)
+
+    if not os.path.exists(initial_path) or not os.path.exists(input_csv):
+        print(f"[skip] missing input for model: {model_name}")
+        return None
+
+    analyzer = DissolutionAnalyzer(initial_path)
+    table = pd.read_csv(input_csv)
+    if "topology_index" not in table.columns:
+        table["topology_index"] = 0.0
+
+    for i, row in table.iterrows():
+        step = int(row["step"])
+        path = geo_path(root, step)
+        if not os.path.exists(path):
+            continue
+        field, _, _ = read_field(path)
+        value = analyzer.topology_index(field)
+        table.at[i, "topology_index"] = value
+        if verbose and (step % 1000 == 0 or i == len(table) - 1):
+            print(f"step={step:08d} index={value:.5f}")
+
+    reference = table.loc[table["step"] == 0, "topology_index"].to_numpy()
+    ref = float(reference[0]) if reference.size else 0.0
+    table["index_norm"] = table["topology_index"] / ref if ref else 0.0
+
+    step_arr = table["step"].to_numpy(dtype=float)
+    table["d_porosity_d_step"] = np.gradient(
+        table["porosity_norm"].to_numpy(dtype=float), step_arr
+    )
+    table["d_index_d_step"] = np.gradient(
+        table["index_norm"].to_numpy(dtype=float), step_arr
+    )
+
+    table.to_csv(output_csv, index=False)
+    print(f"[done] {model_name} -> {output_csv}")
+    return output_csv
+
+
+JOBS = [
+    {"root": "/path/to/experiment_A/results1", "model": "model_01"},
+    {"root": "/path/to/experiment_A/results2", "model": "model_02"},
+    {"root": "/path/to/experiment_B/results1", "model": "model_03"},
+]
+
+
+def run_all(jobs):
+    total = len(jobs)
+    for i, job in enumerate(jobs):
+        print(f"progress [{i + 1}/{total}] {job['model']}")
         try:
-            with open(self.input_file, "rb") as file:
-                self.nx, self.ny, self.nz = struct.unpack("iii", file.read(12))
-                raw = file.read(self.nx * self.ny * self.nz * 4)
-            self.data = np.frombuffer(raw, dtype=np.int32).reshape((self.ny, self.nx))
-        except FileNotFoundError:
-            print(f"Error: {self.input_file} not found. Using a 200x200 test grid.")
-            self.nx, self.ny, self.nz = 200, 200, 1
-            self.data = np.ones((self.ny, self.nx), dtype=np.int32)
-
-        self.solid_mask = self.data == 1
-        self.total_solid = np.sum(self.solid_mask)
-        print(f"Loaded: {self.nx}x{self.ny}, solid nodes: {self.total_solid}")
-
-    def _get_solid_coords(self):
-        return np.where(self.solid_mask)
-
-    def _apply_mineral_map(self, mineral_map):
-        new_data = self.data.copy()
-        new_data[self.solid_mask] = mineral_map[self.solid_mask]
-        return new_data
-
-    def _get_exact_counts(self):
-        n_qtz = int(self.total_solid * self.pct_qtz)
-        n_dol = int(self.total_solid * self.pct_dol)
-        n_cal = self.total_solid - n_qtz - n_dol
-        return n_qtz, n_dol, n_cal
-
-    def generate_homogeneous(self, scale=3.0):
-        print("Generating case1")
-        n_qtz, n_dol, n_cal = self._get_exact_counts()
-        feature_field = gaussian_filter(np.random.normal(0, 1, (self.ny, self.nx)), sigma=scale)
-        solid_indices = self._get_solid_coords()
-        sorted_idx = np.argsort(feature_field[solid_indices])
-        mineral_map = np.zeros_like(self.data)
-
-        qtz_idx = sorted_idx[:n_qtz]
-        reactive_idx = sorted_idx[n_qtz:]
-        mineral_map[solid_indices[0][qtz_idx], solid_indices[1][qtz_idx]] = 4
-
-        reactive_minerals = np.array([3] * n_dol + [2] * n_cal)
-        np.random.shuffle(reactive_minerals)
-        mineral_map[solid_indices[0][reactive_idx], solid_indices[1][reactive_idx]] = reactive_minerals
-        return self._apply_mineral_map(mineral_map)
-
-    def generate_layered(self, angle=0, scale=35.0):
-        print(f"Generating layered case at {angle} degrees")
-        n_qtz, n_dol, _ = self._get_exact_counts()
-        y, x = np.indices((self.ny, self.nx))
-        theta = np.radians(angle)
-        feature_field = np.sin(2 * np.pi * (x * np.cos(theta) + y * np.sin(theta)) / scale)
-        solid_indices = self._get_solid_coords()
-        sorted_idx = np.argsort(feature_field[solid_indices])
-        mineral_map = np.zeros_like(self.data)
-
-        qtz_idx = sorted_idx[:n_qtz]
-        dol_idx = sorted_idx[n_qtz:n_qtz + n_dol]
-        cal_idx = sorted_idx[n_qtz + n_dol:]
-        mineral_map[solid_indices[0][qtz_idx], solid_indices[1][qtz_idx]] = 4
-        mineral_map[solid_indices[0][dol_idx], solid_indices[1][dol_idx]] = 3
-        mineral_map[solid_indices[0][cal_idx], solid_indices[1][cal_idx]] = 2
-        return self._apply_mineral_map(mineral_map)
-
-    def generate_replacement(self, scale=10.0):
-        print("Generating case4")
-        n_qtz, n_dol, _ = self._get_exact_counts()
-        qtz_field = gaussian_filter(np.random.normal(0, 1, (self.ny, self.nx)), sigma=scale)
-        solid_indices = self._get_solid_coords()
-        sorted_qtz_idx = np.argsort(qtz_field[solid_indices])
-        mineral_map = np.zeros_like(self.data)
-
-        qtz_idx = sorted_qtz_idx[:n_qtz]
-        qtz_y, qtz_x = solid_indices[0][qtz_idx], solid_indices[1][qtz_idx]
-        mineral_map[qtz_y, qtz_x] = 4
-
-        carb_idx = sorted_qtz_idx[n_qtz:]
-        carb_y, carb_x = solid_indices[0][carb_idx], solid_indices[1][carb_idx]
-        carb_mask = np.zeros((self.ny, self.nx), dtype=bool)
-        carb_mask[carb_y, carb_x] = True
-        effective_dists = distance_transform_edt(carb_mask)[carb_y, carb_x]
-        effective_dists += np.random.normal(0, 0.2, len(effective_dists))
-        sorted_carb_idx = np.argsort(effective_dists)
-
-        dol_idx = sorted_carb_idx[:n_dol]
-        cal_idx = sorted_carb_idx[n_dol:]
-        mineral_map[carb_y[dol_idx], carb_x[dol_idx]] = 3
-        mineral_map[carb_y[cal_idx], carb_x[cal_idx]] = 2
-        return self._apply_mineral_map(mineral_map)
-
-    def generate_fracture(self):
-        print("Generating case5")
-        n_qtz, n_dol, n_cal = self._get_exact_counts()
-        fracture_skeleton = np.ones((self.ny, self.nx), dtype=bool)
-        x_coords = np.arange(self.nx)
-
-        for _ in range(np.random.randint(3, 6)):
-            y_start = np.random.uniform(0.1 * self.ny, 0.9 * self.ny)
-            y_end = np.random.uniform(0.1 * self.ny, 0.9 * self.ny)
-            y_curve = np.linspace(y_start, y_end, self.nx)
-            y_curve += gaussian_filter(np.random.normal(0, 1, self.nx), sigma=self.nx / 10) * (self.ny / 8)
-            y_curve += gaussian_filter(np.random.normal(0, 1, self.nx), sigma=self.nx / 50) * (self.ny / 25)
-            y_curve = np.clip(y_curve, 0, self.ny - 1).astype(int)
-            fracture_skeleton[y_curve, x_coords] = False
-            fracture_skeleton[np.clip(y_curve - 1, 0, self.ny - 1), x_coords] = False
-            fracture_skeleton[np.clip(y_curve + 1, 0, self.ny - 1), x_coords] = False
-
-        solid_indices = self._get_solid_coords()
-        sorted_idx = np.argsort(distance_transform_edt(fracture_skeleton)[solid_indices])
-        mineral_map = np.zeros_like(self.data)
-        cal_idx = sorted_idx[:n_cal]
-        dol_idx = sorted_idx[n_cal:n_cal + n_dol]
-        qtz_idx = sorted_idx[n_cal + n_dol:]
-        mineral_map[solid_indices[0][cal_idx], solid_indices[1][cal_idx]] = 2
-        mineral_map[solid_indices[0][dol_idx], solid_indices[1][dol_idx]] = 3
-        mineral_map[solid_indices[0][qtz_idx], solid_indices[1][qtz_idx]] = 4
-        return self._apply_mineral_map(mineral_map)
-
-    def save_output(self, new_data, base_name):
-        with open(f"{base_name}.dat", "wb") as file:
-            file.write(struct.pack("iii", self.nx, self.ny, self.nz))
-            file.write(new_data.astype(np.int32).tobytes())
-
-        image = np.zeros((*new_data.shape, 3), dtype=np.uint8)
-        image[new_data == 0] = [255, 255, 255]
-        image[new_data == 2] = [255, 0, 0]
-        image[new_data == 3] = [0, 255, 0]
-        image[new_data == 4] = [128, 128, 128]
-        plt.imsave(f"{base_name}.jpg", np.flipud(image))
-        print(f"Saved: {base_name}.dat and {base_name}.jpg")
+            process_job(job["root"], job["model"])
+        except Exception as exc:
+            print(f"[error] {job['model']}: {exc}")
 
 
 if __name__ == "__main__":
-    output_dir = "simulation_cases"
-    os.makedirs(output_dir, exist_ok=True)
-    generator = MineralTopologyGenerator("lbm_input.dat")
-
-    cases = {
-        "case1": generator.generate_homogeneous(),
-        "case2": generator.generate_layered(angle=0),
-        "case3": generator.generate_layered(angle=90),
-        "case4": generator.generate_replacement(),
-        "case5": generator.generate_fracture(),
-    }
-    for name, mineral_map in cases.items():
-        generator.save_output(mineral_map, os.path.join(output_dir, name))
+    run_all(JOBS)
