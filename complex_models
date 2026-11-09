@@ -1,145 +1,163 @@
-import heapq
-import os
 import struct
+from pathlib import Path
 
 import numpy as np
-import pandas as pd
+from scipy.ndimage import distance_transform_edt, gaussian_filter
 
 
-CASE_SUBDIR = "sim_cases_final0"
-GEO_SUBDIR = "geo"
-GEO_PREFIX = "geo_"
-INPUT_CSV = "evolution.csv"
-OUTPUT_CSV = "evolution_with_index.csv"
+INPUT_DIR = Path("input_dat")
+OUTPUT_DIR = Path("generated_dat")
+
+N_REALIZATIONS = 19
+SEED_BASE = 0
+
+VOID, CALCITE, DOLOMITE, QUARTZ = 0, 2, 3, 4
 
 
-def read_field(path):
-    with open(path, "rb") as f:
-        nx, ny, nz = struct.unpack("iii", f.read(12))
-        raw = f.read(nx * ny * nz * 4)
-    field = np.frombuffer(raw, dtype=np.int32).reshape((ny, nx))
-    return field, nx, ny
+def read_dat(path):
+    with path.open("rb") as handle:
+        nx, ny, nz = struct.unpack("iii", handle.read(12))
+        raw = handle.read(nx * ny * nz * 4)
+    if nz != 1:
+        raise ValueError(f"expected nz=1, got {nz}")
+    if len(raw) != nx * ny * nz * 4:
+        raise ValueError(f"unexpected payload length in {path.name}")
+    return np.frombuffer(raw, dtype=np.int32).reshape(ny, nx).copy(), nx, ny, nz
 
 
-def geo_path(root, step):
-    return os.path.join(root, GEO_SUBDIR, f"{GEO_PREFIX}{step:08d}.dat")
+def write_dat(path, data, nx, ny, nz=1):
+    with path.open("wb") as handle:
+        handle.write(struct.pack("iii", nx, ny, nz))
+        handle.write(np.asarray(data, dtype=np.int32).tobytes())
 
 
-class DissolutionAnalyzer:
-    def __init__(self, initial_field_path):
-        self.cost_by_phase = {
-            0: 0.0,
-            2: 1.0,
-            3: 50.0,
-            4: float("inf"),
-        }
-        self.reference_cost = 1.0
+class MineralTopologyGenerator:
+    frac_quartz = 0.50
+    frac_dolomite = 0.15
 
-        initial_field, self.nx, self.ny = read_field(initial_field_path)
-        self.initial_solid = initial_field != 0
-        self.solid_count = int(self.initial_solid.sum())
-        self.u_char = float(self.ny) * self.reference_cost
+    def __init__(self, geometry, rng):
+        self.geometry = geometry
+        self.solid_mask = geometry != VOID
+        self.ny, self.nx = geometry.shape
+        self.rng = rng
+        self.total_solid = int(self.solid_mask.sum())
+        if self.total_solid == 0:
+            raise ValueError("geometry contains no solid voxels")
 
-    def cost_map(self, field):
-        cost = np.zeros(field.shape, dtype=float)
-        for phase, value in self.cost_by_phase.items():
-            cost[field == phase] = value
-        return cost
+    def _counts(self):
+        n_quartz = int(self.total_solid * self.frac_quartz)
+        n_dolomite = int(self.total_solid * self.frac_dolomite)
+        return n_quartz, n_dolomite, self.total_solid - n_quartz - n_dolomite
 
-    def accumulated_cost(self, field):
-        ny, nx = field.shape
-        cost = self.cost_map(field)
-        dist = np.full((ny, nx), np.inf)
-        heap = []
+    def _solid_coords(self):
+        return np.where(self.solid_mask)
 
-        for y, x in zip(*np.where(field == 0)):
-            y, x = int(y), int(x)
-            dist[y, x] = 0.0
-            heapq.heappush(heap, (0.0, y, x))
+    def _apply(self, minerals):
+        result = self.geometry.copy()
+        result[self.solid_mask] = minerals[self.solid_mask]
+        return result
 
-        neighbors = ((-1, 0), (1, 0), (0, -1), (0, 1))
+    def homogeneous(self, scale=3.0):
+        n_quartz, n_dolomite, n_calcite = self._counts()
+        field = gaussian_filter(self.rng.normal(size=(self.ny, self.nx)), sigma=scale)
+        yy, xx = self._solid_coords()
+        order = np.argsort(field[yy, xx])
+        minerals = np.zeros_like(self.geometry)
+        minerals[yy[order[:n_quartz]], xx[order[:n_quartz]]] = QUARTZ
+        reactive = order[n_quartz:]
+        mixed = np.array([DOLOMITE] * n_dolomite + [CALCITE] * n_calcite, dtype=np.int32)
+        self.rng.shuffle(mixed)
+        minerals[yy[reactive], xx[reactive]] = mixed
+        return self._apply(minerals)
 
-        while heap:
-            d, y, x = heapq.heappop(heap)
-            if d > dist[y, x]:
-                continue
-            for dy, dx in neighbors:
-                j, i = y + dy, x + dx
-                if 0 <= j < ny and 0 <= i < nx:
-                    w = cost[j, i]
-                    if w == np.inf:
-                        continue
-                    nd = d + w
-                    if nd < dist[j, i]:
-                        dist[j, i] = nd
-                        heapq.heappush(heap, (nd, j, i))
+    def layered(self, angle, scale=35.0):
+        n_quartz, n_dolomite, _ = self._counts()
+        y, x = np.indices((self.ny, self.nx))
+        theta = np.radians(angle)
+        field = np.sin(2 * np.pi * (x * np.cos(theta) + y * np.sin(theta)) / scale)
+        yy, xx = self._solid_coords()
+        order = np.argsort(field[yy, xx], kind="stable")
+        minerals = np.zeros_like(self.geometry)
+        minerals[yy[order[:n_quartz]], xx[order[:n_quartz]]] = QUARTZ
+        band = order[n_quartz:n_quartz + n_dolomite]
+        minerals[yy[band], xx[band]] = DOLOMITE
+        rest = order[n_quartz + n_dolomite:]
+        minerals[yy[rest], xx[rest]] = CALCITE
+        return self._apply(minerals)
 
-        return dist
+    def replacement(self, scale=10.0):
+        n_quartz, n_dolomite, _ = self._counts()
+        field = gaussian_filter(self.rng.normal(size=(self.ny, self.nx)), sigma=scale)
+        yy, xx = self._solid_coords()
+        order = np.argsort(field[yy, xx])
+        minerals = np.zeros_like(self.geometry)
+        quartz = order[:n_quartz]
+        minerals[yy[quartz], xx[quartz]] = QUARTZ
+        carbonate = order[n_quartz:]
+        cy, cx = yy[carbonate], xx[carbonate]
+        carbonate_mask = np.zeros_like(self.solid_mask)
+        carbonate_mask[cy, cx] = True
+        distances = distance_transform_edt(carbonate_mask)[cy, cx]
+        effective = distances + self.rng.normal(0.0, 0.2, len(distances))
+        local = np.argsort(effective)
+        minerals[cy[local[:n_dolomite]], cx[local[:n_dolomite]]] = DOLOMITE
+        minerals[cy[local[n_dolomite:]], cx[local[n_dolomite:]]] = CALCITE
+        return self._apply(minerals)
 
-    def topology_index(self, field):
-        dist = self.accumulated_cost(field)
-        u = dist[self.initial_solid]
-        return float(np.sum(np.exp(-u / self.u_char)) / self.solid_count)
-
-
-def process_job(root, model_name, verbose=True):
-    initial_path = os.path.join(root, CASE_SUBDIR, f"{model_name}.dat")
-    input_csv = os.path.join(root, INPUT_CSV)
-    output_csv = os.path.join(root, OUTPUT_CSV)
-
-    if not os.path.exists(initial_path) or not os.path.exists(input_csv):
-        print(f"[skip] missing input for model: {model_name}")
-        return None
-
-    analyzer = DissolutionAnalyzer(initial_path)
-    table = pd.read_csv(input_csv)
-    if "topology_index" not in table.columns:
-        table["topology_index"] = 0.0
-
-    for i, row in table.iterrows():
-        step = int(row["step"])
-        path = geo_path(root, step)
-        if not os.path.exists(path):
-            continue
-        field, _, _ = read_field(path)
-        value = analyzer.topology_index(field)
-        table.at[i, "topology_index"] = value
-        if verbose and (step % 1000 == 0 or i == len(table) - 1):
-            print(f"step={step:08d} index={value:.5f}")
-
-    reference = table.loc[table["step"] == 0, "topology_index"].to_numpy()
-    ref = float(reference[0]) if reference.size else 0.0
-    table["index_norm"] = table["topology_index"] / ref if ref else 0.0
-
-    step_arr = table["step"].to_numpy(dtype=float)
-    table["d_porosity_d_step"] = np.gradient(
-        table["porosity_norm"].to_numpy(dtype=float), step_arr
-    )
-    table["d_index_d_step"] = np.gradient(
-        table["index_norm"].to_numpy(dtype=float), step_arr
-    )
-
-    table.to_csv(output_csv, index=False)
-    print(f"[done] {model_name} -> {output_csv}")
-    return output_csv
-
-
-JOBS = [
-    {"root": "/path/to/experiment_A/results1", "model": "model_01"},
-    {"root": "/path/to/experiment_A/results2", "model": "model_02"},
-    {"root": "/path/to/experiment_B/results1", "model": "model_03"},
-]
+    def fracture(self):
+        n_quartz, n_dolomite, n_calcite = self._counts()
+        skeleton = np.ones((self.ny, self.nx), dtype=bool)
+        x = np.arange(self.nx)
+        for _ in range(int(self.rng.integers(3, 6))):
+            start = self.rng.uniform(0.1 * self.ny, 0.9 * self.ny)
+            end = self.rng.uniform(0.1 * self.ny, 0.9 * self.ny)
+            base = np.linspace(start, end, self.nx)
+            low = gaussian_filter(self.rng.normal(size=self.nx), sigma=self.nx / 10) * (self.ny / 8)
+            high = gaussian_filter(self.rng.normal(size=self.nx), sigma=self.nx / 50) * (self.ny / 25)
+            curve = np.clip(base + low + high, 0, self.ny - 1).astype(int)
+            skeleton[curve, x] = False
+            skeleton[np.clip(curve - 1, 0, self.ny - 1), x] = False
+            skeleton[np.clip(curve + 1, 0, self.ny - 1), x] = False
+        distances = distance_transform_edt(skeleton)
+        yy, xx = self._solid_coords()
+        order = np.argsort(distances[yy, xx])
+        minerals = np.zeros_like(self.geometry)
+        minerals[yy[order[:n_calcite]], xx[order[:n_calcite]]] = CALCITE
+        band = order[n_calcite:n_calcite + n_dolomite]
+        minerals[yy[band], xx[band]] = DOLOMITE
+        rest = order[n_calcite + n_dolomite:]
+        minerals[yy[rest], xx[rest]] = QUARTZ
+        return self._apply(minerals)
 
 
-def run_all(jobs):
-    total = len(jobs)
-    for i, job in enumerate(jobs):
-        print(f"progress [{i + 1}/{total}] {job['model']}")
-        try:
-            process_job(job["root"], job["model"])
-        except Exception as exc:
-            print(f"[error] {job['model']}: {exc}")
+CONSTRUCTORS = {
+    "homogeneous": lambda g: g.homogeneous(),
+    "layered_0": lambda g: g.layered(angle=0.0, scale=35.0),
+    "layered_90": lambda g: g.layered(angle=90.0, scale=35.0),
+    "replacement": lambda g: g.replacement(),
+    "fracture": lambda g: g.fracture(),
+}
+
+
+def main():
+    source = sorted(INPUT_DIR.glob("*.dat"))
+    if not source:
+        raise FileNotFoundError(f"no .dat input found in {INPUT_DIR}")
+
+    base, nx, ny, nz = read_dat(source[0])
+    geometry = np.where(base == VOID, VOID, 1).astype(np.int32)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    for realization in range(1, N_REALIZATIONS + 1):
+        for index, (name, constructor) in enumerate(CONSTRUCTORS.items()):
+            seed = SEED_BASE + realization * 100 + index
+            generator = MineralTopologyGenerator(geometry, np.random.default_rng(seed))
+            data = constructor(generator)
+            path = OUTPUT_DIR / f"{name}_{realization:02d}.dat"
+            write_dat(path, data, nx, ny, nz)
+        print(f"realization {realization:02d}/{N_REALIZATIONS}")
 
 
 if __name__ == "__main__":
-    run_all(JOBS)
+    main()
