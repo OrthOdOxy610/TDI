@@ -14,6 +14,7 @@ INPUT_CSV = "evolution.csv"
 OUTPUT_CSV = "evolution_with_index.csv"
 
 NEIGHBORS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+TRACK_CURRENT_SOLID = True
 
 
 def read_field(path):
@@ -101,9 +102,13 @@ class DissolutionAnalyzer:
 
         return dist
 
+    def solid_mask(self, field):
+        return field != 0 if TRACK_CURRENT_SOLID else self.initial_solid
+
     def topology_index(self, field):
         dist = self.accumulated_cost(field)
-        u = dist[self.initial_solid]
+        mask = self.solid_mask(field)
+        u = dist[mask]
         u = u[np.isfinite(u)]
         if u.size == 0 or self.solid_count == 0:
             return 0.0
